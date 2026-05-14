@@ -41,7 +41,7 @@ _scheduler_lock = threading.Lock()  # Prevent concurrent scheduler starts
 class PluginConfig:
     """Centralized configuration constants for Event Channel Managarr."""
 
-    PLUGIN_VERSION = "1.26.1291442"
+    PLUGIN_VERSION = "1.26.1342155"
 
     # Default timezone for scheduling
     DEFAULT_TIMEZONE = "America/Chicago"
@@ -463,6 +463,17 @@ class Plugin:
                 "type": "boolean",
                 "default": self.DEFAULT_MANAGE_DUMMY_EPG,
                 "help_text": "If enabled, visible channels with no EPG assigned will be bound to a plugin-managed dummy EPG source. The guide shows the extracted event during its time window (and 'Offline' outside it), or the channel name as a 24-hour fallback if no time is parseable.",
+            },
+            {
+                "id": "dummy_epg_channel_format",
+                "label": "📡 Channel Name Format",
+                "type": "select",
+                "default": "US",
+                "help_text": "How channel names are structured for the dummy EPG parser. US = 'PPV EVENT 12: Title (MM.DD HH:MM AM/PM TZ)'. SE = 'PREFIX | Event Title | DDD DD Mon HH:MM TZ | extras | channel name' — the last segment (e.g. 'SE: VIAPLAY PPV 20') is stored as the EPG display name so the guide channel list shows the broadcaster instead of the full stream name.",
+                "options": [
+                    {"label": "US  –  PPV/LIVE EVENT ##: Title (MM.DD HH:MM AM/PM TZ)",             "value": "US"},
+                    {"label": "SE  –  PREFIX | Title | DDD DD Mon HH:MM TZ | extras | channel name", "value": "SE"},
+                ]
             },
             {
                 "id": "dummy_epg_event_duration_hours",
@@ -960,6 +971,8 @@ class Plugin:
                 settings["dummy_epg_event_duration_hours"] = self.DEFAULT_EVENT_DURATION_HOURS
             if "dummy_epg_event_timezone" not in settings:
                 settings["dummy_epg_event_timezone"] = self.DEFAULT_DUMMY_EPG_TIMEZONE
+            if "dummy_epg_channel_format" not in settings:
+                settings["dummy_epg_channel_format"] = "US"
             if "rate_limiting" not in settings:
                 settings["rate_limiting"] = self.DEFAULT_RATE_LIMITING
 
@@ -2127,16 +2140,18 @@ class Plugin:
         Returns overrides for the three rewritable title templates plus
         `output_timezone` for the managed dummy EPG source.
 
-        - When source TZ == display TZ, or either TZ is invalid/empty:
-          returns DEFAULTS (plain templates) and writes
-          `output_timezone=""` so any previously-saved value is cleared
+        - When source TZ is invalid/empty: returns DEFAULTS (plain templates,
+          `output_timezone=""`) so any previously-saved value is cleared
           (the diff-and-save loop never deletes keys).
-        - Otherwise: returns localized templates with the date placeholder
-          driven by `date_format` (US/Auto -> {month}/{day};
-          EU -> {day}/{month}) and a TZ abbreviation suffix computed for
-          "now" in the display TZ. If %Z returns a numeric offset
-          (e.g., +0530), the suffix is omitted but time conversion still
-          happens via Dispatcharr's output_timezone.
+        - When source TZ is valid but display TZ is empty or equal to source TZ:
+          returns plain templates but with `output_timezone=source_tz_name` so
+          Dispatcharr formats {starttime}/{endtime} in the correct locale
+          (e.g. 24h for European zones instead of defaulting to 12h AM/PM).
+        - When source TZ != display TZ: returns localized templates with the date
+          placeholder driven by `date_format` (US/Auto -> {month}/{day};
+          EU -> {day}/{month}) and a TZ abbreviation suffix computed for "now"
+          in the display TZ. If %Z returns a numeric offset (e.g., +0530), the
+          suffix is omitted but time conversion still happens via output_timezone.
 
         `fallback_title_template` is set in the base `managed_props` and
         is never overridden here.
@@ -2151,14 +2166,24 @@ class Plugin:
         source_tz_name = str(settings.get("dummy_epg_event_timezone", "")).strip()
         display_tz_name = str(settings.get("timezone", "")).strip()
 
-        if not source_tz_name or not display_tz_name or source_tz_name == display_tz_name:
+        if not source_tz_name:
             return DEFAULTS
 
         try:
-            pytz.timezone(source_tz_name)  # validate only; renderer resolves source TZ itself
-            display_tz = pytz.timezone(display_tz_name)
+            pytz.timezone(source_tz_name)  # validate
         except pytz.exceptions.UnknownTimeZoneError:
             return DEFAULTS
+
+        # No display TZ configured, or same as source: no time conversion needed,
+        # but still pass output_timezone so Dispatcharr formats {starttime} in the
+        # correct locale (e.g. 24h for European zones rather than 12h AM/PM default).
+        if not display_tz_name or source_tz_name == display_tz_name:
+            return {**DEFAULTS, "output_timezone": source_tz_name}
+
+        try:
+            display_tz = pytz.timezone(display_tz_name)
+        except pytz.exceptions.UnknownTimeZoneError:
+            return {**DEFAULTS, "output_timezone": source_tz_name}
 
         abbrev = datetime.now(display_tz).strftime("%Z")
         suffix = f" {abbrev}" if abbrev and abbrev.isalpha() else ""
@@ -2194,31 +2219,53 @@ class Plugin:
                                     self.DEFAULT_DUMMY_EPG_TIMEZONE)).strip() or self.DEFAULT_DUMMY_EPG_TIMEZONE
 
         # Keys the plugin owns. Any other keys on the source are left untouched.
-        # Regexes validated against these four real channel names:
+        # Regexes validated against these channel name formats:
+        #
+        # Format: "US" (default)
         #   "PPV EVENT 12: Cage Fury FC 153 (4.17 8:30 PM ET)"  -> title="Cage Fury FC 153"
         #   "LIVE EVENT 01   9:45am Suslenkov v Mann"           -> title="Suslenkov v Mann"
         #   "PPV EVENT 25: OUTDOOR THEATRE Live From Coachella" -> title="OUTDOOR THEATRE Live From Coachella"
         #   "PPV02 | UFC 327: English Apr 14 4:30 PM"           -> title="UFC 327: English"
-        # The title capture stops at the first of: " (", a time token, or a month-name token.
-        # leading_time handles names where the time appears BEFORE the event text (LIVE format).
-        managed_props = {
-            "title_pattern": (
+        #
+        # Format: "SE" (pipe-delimited, 24h time, named month)
+        #   "LIVE | GIRONA - REAL SOCIEDAD | Thu 14 May 19:55 CEST (SE) | 8K EXCLUSIVE | SE: TV4 PLAY PPV 7"
+        #    prefix ^  title ^              ^ air time                   ^ extras        ^ channel name
+        #     -> title="GIRONA - REAL SOCIEDAD"
+        channel_format = str(settings.get("dummy_epg_channel_format", "US")).strip().upper()
+
+        if channel_format == "SE":
+            title_pattern = r"\|\s*(?P<title>[^|]+?)\s*\|"
+            time_pattern  = r"(?P<hour>\d{2}):(?P<minute>\d{2})"
+            date_pattern  = (
+                r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+"
+                r"(?P<day>\d{1,2})\s+"
+                r"(?P<month_name>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b"
+            )
+        else:  # US (default)
+            title_pattern = (
                 r"(?:PPV|LIVE)\s*(?:EVENT\s*)?\d+\s*[:|\s]\s*"
                 r"(?:(?P<leading_time>\d{1,2}(?::\d{2})?\s*[AaPp][Mm])\s+)?"
                 r"(?P<title>.+?)"
                 r"(?=\s*\(|\s+\d{1,2}(?::\d{2})?\s*[AaPp][Mm]|"
                 r"\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d+|$)"
-            ),
-            "time_pattern": r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>[AaPp][Mm])",
-            "date_pattern": r"\b(?P<month>\d{1,2})[./](?P<day>\d{1,2})(?:[./](?P<year>\d{2,4}))?\b",
+            )
+            time_pattern  = r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>[AaPp][Mm])"
+            date_pattern  = r"\b(?P<month>\d{1,2})[./](?P<day>\d{1,2})(?:[./](?P<year>\d{2,4}))?\b"
+
+        managed_props = {
+            "title_pattern": title_pattern,
+            "time_pattern":  time_pattern,
+            "date_pattern":  date_pattern,
             "title_template": "{title}",
             # Informative pre/post-event titles using Dispatcharr's
             # auto-computed {starttime}/{endtime} placeholders plus the
             # extracted {title}. Examples at render time:
-            #   Upcoming at 8:00 PM: Cage Fury FC 153
-            #   Ended at 11:00 PM: Cage Fury FC 153
+            #   Upcoming at 8:00 PM: Cage Fury FC 153   (US)
+            #   Upcoming at 18:50: IFK NORRKÖPING - ...  (SE)
             "upcoming_title_template": "Upcoming at {starttime}: {title}",
-            "ended_title_template": "Ended at {endtime}: {title}",
+            "ended_title_template":    "Ended at {endtime}: {title}",
+            # {channel_name} resolves to EPGData.name, which the plugin sets to the
+            # extracted broadcaster name (last pipe segment) for SE format channels.
             "fallback_title_template": "{channel_name}",
             "program_duration": duration_hours * 60,
             "timezone": tz_value,
@@ -2265,6 +2312,12 @@ class Plugin:
                 logger.error(f"{LOG_PREFIX} Failed to update managed EPGSource: {e}")
                 return None
         return source
+
+    def _extract_se_display_name(self, channel_name):
+        """Return the last pipe-separated segment of an SE-format channel name.
+        Falls back to the full name if no pipe is found (e.g. already renamed)."""
+        m = re.search(r'\|\s*([^|]+?)\s*$', channel_name)
+        return m.group(1) if m else channel_name
 
     def _attach_managed_epg(self, channels, managed_source, logger, rate_limiter=None):
         """Bind each channel in `channels` to the managed dummy source via an EPGData row.
@@ -2390,6 +2443,31 @@ class Plugin:
 
         keep_ids = set(enabled_channel_ids) if toggle_on else set()
         detached_ids = self._detach_managed_epg(managed_source, keep_ids, logger)
+
+        # SE format: write the last pipe-segment (broadcaster name, e.g. "SE: VIAPLAY PPV 20")
+        # into EPGData.name so that {channel_name} in EPG templates and the guide's channel
+        # list show the short broadcaster name instead of the full stream name.
+        channel_format = str(settings.get("dummy_epg_channel_format", "US")).strip().upper()
+        if toggle_on and managed_source and channel_format == "SE":
+            from apps.epg.models import EPGData
+            attached_channels = list(
+                Channel.objects.filter(
+                    id__in=enabled_channel_ids,
+                    epg_data__epg_source=managed_source,
+                ).select_related("epg_data")
+            )
+            to_update = []
+            for ch in attached_channels:
+                if ch.epg_data is None:
+                    continue
+                short_name = self._extract_se_display_name(ch.name)
+                if ch.epg_data.name != short_name:
+                    ch.epg_data.name = short_name
+                    to_update.append(ch.epg_data)
+            if to_update:
+                with transaction.atomic():
+                    EPGData.objects.bulk_update(to_update, ["name"])
+                logger.info(f"{LOG_PREFIX} Updated EPG display name for {len(to_update)} SE channel(s)")
 
         return attached_ids, detached_ids
 
@@ -2822,6 +2900,7 @@ class Plugin:
                     "manage_dummy_epg",
                     "dummy_epg_event_duration_hours",
                     "dummy_epg_event_timezone",
+                    "dummy_epg_channel_format",
                     "scheduled_times",
                     "enable_scheduled_csv_export",
                 ]

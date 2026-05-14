@@ -1,6 +1,6 @@
 {
   "name": "Event Channel Managarr",
-  "version": "1.26.1291442",
+  "version": "1.26.1342155",
   "description": "Automates channel visibility by hiding channels without events and showing those with events, based on EPG data and channel names. Optionally manages dummy EPG for channels without real EPG.",
   "author": "PiratesIRC",
   "license": "MIT",
@@ -31,6 +31,7 @@
     {"id": "manage_dummy_epg", "label": "🗓️ Manage Dummy EPG", "type": "boolean", "default": false},
     {"id": "dummy_epg_event_duration_hours", "label": "⏱️ Event Duration (hours)", "type": "number", "default": 3},
     {"id": "dummy_epg_event_timezone", "label": "📺 Channel Name Event Timezone", "type": "select", "default": "US/Eastern"},
+    {"id": "dummy_epg_channel_format", "label": "📡 Channel Name Format", "type": "select", "default": "US"},
 
     {"id": "_section_scheduling", "label": "⏰ Scheduling & Export", "type": "info", "description": "Scheduled runs and CSV export options."},
     {"id": "scheduled_times", "label": "⏰ Scheduled Run Times (24-hour)", "type": "text", "default": "", "placeholder": "0600,1300,1800"},
